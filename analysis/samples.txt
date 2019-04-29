@@ -1,0 +1,5 @@
+ID	Ident	Sample	Technique	Status	Sex
+1001	1001_S1_10X_pbmc	pbmc_1	10X	healthy	male
+1002	1002_S2_10X_pbmc	pbmc_2	10X	healthy	female
+1003	1003_S3_10X_pbmc	pbmc_2	10X	disease	male
+1004	1003_S3_10X_pbmc	pbmc_1	10X	disease	female

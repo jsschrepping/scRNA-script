@@ -1,0 +1,2074 @@
+---
+title: <title>
+author: <author>
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document: 
+    theme: united
+    code_download: true
+    toc: yes
+    toc_depth: 6
+    toc_float: yes
+---
+
+Docker command: 
+
+docker run -d -p <port>:8787 -e constraint:node==<swarmNode> -e USER=<user> -e PASSWORD=<password> --name <name> -v </path/to/folder/>:/home/<user>/data jsschrepping/r_docker:jss_v0.0.3_cran
+
+For this generic scRNA-seq analysis script, we produced a test data set by downsampling a public 10X v3 PBMC data set:
+https://support.10xgenomics.com/single-cell-gene-expression/datasets/3.0.0/pbmc_10k_protein_v3
+
+The fastq file from lane 1 was downsampled 4 times with different seeds and to slightly diverging read numbers in order to represent variability in sequencing depth.
+
+Bash script:
+
+```{r, engine = 'bash', eval = FALSE}
+#!/bin/bash
+
+for file in /data/pbmc_10k_v3_fastqs/*_L001_*.fastq.gz
+do
+    echo $file
+    if [[ $file = *"R1"* ]]; then
+        echo "read 1"
+        seqtk sample -s100 $file 0.05 > /data/pbmc_10k_v3_fastqs_subsample/1001_S1_10X_pbmc_L001_R1_001.fastq
+        seqtk sample -s1509 $file 0.067 > /data/pbmc_10k_v3_fastqs_subsample/1002_S2_10X_pbmc_L001_R1_001.fastq
+        seqtk sample -s42 $file 0.042 > /data/pbmc_10k_v3_fastqs_subsample/1003_S3_10X_pbmc_L001_R1_001.fastq
+    fi
+
+    if [[ $file = *"R2"* ]]; then
+        echo "read 2"
+        seqtk sample -s100 $file 0.05 > /data/pbmc_10k_v3_fastqs_subsample/1001_S1_10X_pbmc_L001_R2_001.fastq
+        seqtk sample -s1509 $file 0.067 > /data/pbmc_10k_v3_fastqs_subsample/1002_S2_10X_pbmc_L001_R2_001.fastq
+        seqtk sample -s42 $file 0.042 > /data/pbmc_10k_v3_fastqs_subsample/1003_S3_10X_pbmc_L001_R2_001.fastq
+    fi
+done
+
+gzip /data/pbmc_10k_v3_fastqs_subsample/*.fastq
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+```{r, message = F}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+library(ggthemes)
+library(ggbeeswarm)
+library(scales)
+library(Seurat)
+library(SingleR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(MAST)
+library(DESeq2)
+library(dichromat)
+library(sctransform)
+```
+
+# Functions
+
+## Expression of gene types
+```{r}
+GeneTypeExpr <- function(input=expr){
+  genes <- rownames(input)
+  IDX <- match(genes, genetypes$SYMBOL)
+  genetypeexpr <- data.frame(SYMBOL=genes,
+                             TYPE=genetypes$TYPE[IDX],
+                             MEAN=rowMeans(input),
+                             SUM=rowSums(input))
+
+  ggplot(genetypeexpr,aes(x=TYPE,y=SUM))+
+    geom_jitter(height = 0, width = 0.1)+
+    scale_y_log10()+
+    ylab("Sum over all cells") +
+    xlab("")+
+    theme_classic() +
+    coord_flip()+
+    theme(text = element_text(size=12),legend.position="none", axis.text.x = element_text(angle = 90, hjust = 1))
+}
+```
+
+
+## Highest expressed genes
+```{r}
+highestGenes <- function(input=expr,
+                         numGenes=50){
+  tmp <- input
+  tmp <- tmp[order(rowSums(tmp), decreasing = T),]
+  tmp <- tmp[1:numGenes,]
+  tmp <- melt(t(tmp))
+  colnames(tmp)<- c("sample","gene","value")
+  tmp$gene <- factor(tmp$gene, levels = rev(unique(tmp$gene)))
+
+  ggplot(tmp, aes(x = tmp$gene, y = value)) +
+      geom_boxplot()+
+      scale_y_continuous()+
+      xlab("Gene")+
+      ylab("Raw UMI Counts")+
+      ggtitle(paste("Counts of", numGenes, "highest expressed genes")) +
+      theme_bw() +
+      coord_flip() +
+      theme(axis.text.x = element_text(size=8, angle = 90, hjust = 1),
+            plot.title = element_text(size = 8, face = "bold"))
+}
+```
+
+
+## GSEA function
+```{r}
+GSEA <- function(object,
+                 condition_up,
+                 condition_down,
+                 cluster,
+                 clustering,
+                 condition ="status",
+                 top=50,
+                 GeneSets =c("GO","KEGG","DO","Hallmark","cannonicalPathways","Motifs","ImmunoSignatures"),
+                 GOntology = "BP",
+                 pCorrection = "bonferroni", # choose the p-value adjustment method
+                 pvalueCutoff = 0.05, # set the unadj. or adj. p-value cutoff (depending on correction method)
+                 qvalueCutoff = 0.05 # set the q-value cutoff (FDR corrected)
+){
+  Idents(object = object) <- clustering
+  tmp <- SubsetData(object = object,ident.use = cluster)
+
+  present_genes <- as.matrix(GetAssayData(object = tmp, slot = 'counts'))
+  present_genes <- rownames(present_genes[apply(present_genes, 1, function (x) {sum(x >= 1)})>3,])
+  present_genes_entrez <- bitr(present_genes, fromType = "SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+
+  Idents(object = tmp) <- "status"
+  markers <- FindAllMarkers(object = tmp, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  markers %>% group_by(cluster) %>% top_n(n = top, wt = avg_logFC) -> top
+
+  top_up <- top[top$cluster==condition_up,]$gene
+  entrez_up <- bitr(top_up, fromType = "SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+  top_down <- top[top$cluster==condition_down,]$gene
+  entrez_down <- bitr(top_down, fromType = "SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)$ENTREZID
+
+  OrgDb = org.Hs.eg.db
+
+  results <- list()
+
+
+  # GO enrichment
+  if("GO" %in% GeneSets){
+    print("Performing GO enrichment")
+      results$GOup <- as.data.frame(enrichGO(gene = entrez_up,
+                                             universe = present_genes_entrez,
+                                             OrgDb = OrgDb,
+                                             ont = GOntology,
+                                             pAdjustMethod = pCorrection,
+                                             pvalueCutoff  = pvalueCutoff,
+                                             qvalueCutoff  = qvalueCutoff,
+                                             readable      = T))
+
+      if(nrow(results$GOup)>0){results$GOup$Enrichment <- paste("GO enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+      results$GOdown <- as.data.frame(enrichGO(gene = entrez_down,
+                                               universe = present_genes_entrez,
+                                               OrgDb = OrgDb,
+                                               ont = GOntology,
+                                               pAdjustMethod = pCorrection,
+                                               pvalueCutoff  = pvalueCutoff,
+                                               qvalueCutoff  = qvalueCutoff,
+                                               readable      = T))
+      if(nrow(results$GOdown)>0){results$GOdown$Enrichment <- paste("GO enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+
+  # KEGG enrichment
+  if("KEGG" %in% GeneSets){
+    print("Performing KEGG enrichment")
+
+    org = "hsa"
+
+    results$KEGGup <- as.data.frame(enrichKEGG(gene = entrez_up,
+                                                  organism = org,
+                                                  universe = present_genes_entrez,
+                                                  pAdjustMethod = pCorrection,
+                                                  pvalueCutoff  = pvalueCutoff,
+                                                  qvalueCutoff = qvalueCutoff))
+    if(nrow(results$KEGGup)>0){results$KEGGup$Enrichment <- paste("KEGG enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$KEGGdown <- as.data.frame(enrichKEGG(gene = entrez_down,
+                                                   organism = org,
+                                                   universe = present_genes_entrez,
+                                                   pAdjustMethod = pCorrection,
+                                                   pvalueCutoff  = pvalueCutoff,
+                                                   qvalueCutoff = qvalueCutoff))
+    if(nrow(results$KEGGdown)>0){results$KEGGdown$Enrichment <- paste("KEGG enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+
+  # DO enrichment
+  if("DO" %in% GeneSets){
+    print("Performing Disease Ontology enrichment")
+
+    results$DOup <- as.data.frame(enrichDO(gene = entrez_up,
+                                             universe = present_genes_entrez,
+                                             pAdjustMethod = pCorrection,
+                                             pvalueCutoff  = pvalueCutoff,
+                                             qvalueCutoff = qvalueCutoff,
+                                             minGSSize     = 5,
+                                             maxGSSize     = 500,
+                                             readable=TRUE))
+    if(nrow(results$DOup)>0){results$DOup$Enrichment <- paste("DO enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$DOdown <- as.data.frame(enrichDO(gene = entrez_down,
+                                               universe = present_genes_entrez,
+                                               pAdjustMethod = pCorrection,
+                                               pvalueCutoff  = pvalueCutoff,
+                                               qvalueCutoff = qvalueCutoff,
+                                               minGSSize     = 5,
+                                               maxGSSize     = 500,
+                                               readable=TRUE))
+    if(nrow(results$DOdown)>0){results$DOdown$Enrichment <- paste("DO enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+
+  # Hallmark enrichment
+  if("Hallmark" %in% GeneSets){
+    print("Performing Hallmark enrichment")
+
+    results$HALLMARKup <- as.data.frame(enricher(entrez_up,
+                                                   TERM2GENE=hallmark_genes,
+                                                   universe = present_genes_entrez,
+                                                   pAdjustMethod = pCorrection,
+                                                   pvalueCutoff  = pvalueCutoff,
+                                                   qvalueCutoff = qvalueCutoff))
+    if(nrow(results$HALLMARKup)>0){results$HALLMARKup$Enrichment <- paste("HALLMARK enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$HALLMARKdown <- as.data.frame(enricher(entrez_down,
+                                                     TERM2GENE=hallmark_genes,
+                                                     universe = present_genes_entrez,
+                                                     pAdjustMethod = pCorrection,
+                                                     pvalueCutoff  = pvalueCutoff,
+                                                     qvalueCutoff = qvalueCutoff))
+    if(nrow(results$HALLMARKdown)>0){results$HALLMARKdown$Enrichment <- paste("HALLMARK enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+
+  # Cannonical Pathway enrichment
+  if("cannonicalPathways" %in% GeneSets){
+    print("Performing Cannonical Pathway (C2) enrichment")
+
+    results$cannonicalPathwaysup <- as.data.frame(enricher(entrez_up,
+                                                             TERM2GENE=cannonicalPathway_genes,
+                                                             universe = present_genes_entrez,
+                                                             pAdjustMethod = pCorrection,
+                                                             pvalueCutoff  = pvalueCutoff,
+                                                             qvalueCutoff = qvalueCutoff))
+      if(nrow(results$cannonicalPathwaysup)>0){results$cannonicalPathwaysup$Enrichment <- paste("Cannonical pathway enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$cannonicalPathwaysdown <- as.data.frame(enricher(entrez_down,
+                                                               TERM2GENE=cannonicalPathway_genes,
+                                                               universe = present_genes_entrez,
+                                                               pAdjustMethod = pCorrection,
+                                                               pvalueCutoff  = pvalueCutoff,
+                                                               qvalueCutoff = qvalueCutoff))
+      if(nrow(results$cannonicalPathwaysdown)>0){results$cannonicalPathwaysdown$Enrichment <- paste("Cannonical pathway enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+
+  # Motif enrichment
+  if("Motifs" %in% GeneSets){
+    print("Performing Motif enrichment")
+
+    results$Motifup <- as.data.frame(enricher(entrez_up,
+                                                TERM2GENE=motifs,
+                                                universe = present_genes_entrez,
+                                                pAdjustMethod = pCorrection,
+                                                pvalueCutoff  = pvalueCutoff,
+                                                qvalueCutoff = qvalueCutoff))
+    if(nrow(results$Motifup)>0){results$Motifup$Enrichment <- paste("TF binding motif enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$Motifdown <- as.data.frame(enricher(entrez_down,
+                                                  TERM2GENE=motifs,
+                                                  universe = present_genes_entrez,
+                                                  pAdjustMethod = pCorrection,
+                                                  pvalueCutoff  = pvalueCutoff,
+                                                  qvalueCutoff = qvalueCutoff))
+      if(nrow(results$Motifdown)>0){results$Motifdown$Enrichment <- paste("TF binding motif enrichment for genes downregulated in cluster",cluster,sep="")}
+  }
+
+  # Immunosignatures enrichment
+  if("ImmunoSignatures" %in% GeneSets){
+    print("Performing immunesignature enrichment")
+
+    results$ImmSigup <- as.data.frame(enricher(entrez_up,
+                                                 TERM2GENE=immuno_genes,
+                                                 universe = present_genes_entrez,
+                                                 pAdjustMethod = pCorrection,
+                                                 pvalueCutoff  = pvalueCutoff,
+                                                 qvalueCutoff = qvalueCutoff))
+    if(nrow(results$ImmSigup)>0){results$ImmSigup$Enrichment <- paste("Immunosignature enrichment for genes upregulated in cluster ",cluster,sep="")}
+
+    results$ImmSigdown <- as.data.frame(enricher(entrez_down,
+                                                   TERM2GENE=immuno_genes,
+                                                   universe = present_genes_entrez,
+                                                   pAdjustMethod = pCorrection,
+                                                   pvalueCutoff  = pvalueCutoff,
+                                                   qvalueCutoff = qvalueCutoff))
+    if(nrow(results$ImmSigdown)>0){results$ImmSigdown$Enrichment <- paste("Immunosignature enrichment for genes downregulated in cluster ",cluster,sep="")}
+  }
+   return(results)
+}
+```
+
+## GSEA dotplot
+```{r}
+dotplotGSEA <- function(x,
+                        show=25,
+                        font.size=10,
+                        title.size=10,
+                        title.width=100,
+                        order="count"){
+  if(nrow(x)<1){
+    print("No enrichment found.")
+  }else{
+    x <- if(nrow(x)>show){x[c(1:show),]}else{x}
+    if(order=="padj"){
+    x <- x[order(x$Count,decreasing=FALSE),]
+    x <- x[order(x$p.adjust,decreasing=TRUE),]
+    x$Description <- ifelse(nchar(x$Description)<100,
+                        paste(substr(x$Description, 1, 100),"[...]",sep=""),
+                        x$Description)
+    x$Description <- factor(x$Description, levels = unique(x$Description))
+    }
+    if(order=="count"){
+    x <- x[order(x$Count,decreasing=FALSE),]
+    x$Description <- ifelse(nchar(x$Description)>60,
+                        paste(substr(x$Description, 1, 60),"[...]",sep=""),
+                        x$Description)
+    x$Description <- factor(x$Description, levels = unique(x$Description))
+    x$GeneRatio <- factor(x$GeneRatio, levels = unique(x$GeneRatio))
+    }
+
+    ggplot(x, aes(x = GeneRatio, y = Description, color = p.adjust)) +
+      geom_point(aes(size = Count)) +
+      scale_colour_gradientn(colours=c('red',
+                                       'orange',
+                                       'darkblue',
+                                       'darkblue'),
+                             limits=c(0,1),
+                             values   = c(0,0.05,0.2,0.5,1),
+                             breaks   = c(0.05,0.2,1),
+                             labels = format(c(0.05,0.2,1))) +
+      ylab(NULL) +
+      ggtitle(paste(strwrap(unique(x$Enrichment), width=title.width), collapse = "\n"))+
+      theme_bw() +
+      theme(text = element_text(size=font.size),
+            plot.title = element_text(size=title.size))
+  }
+}
+```
+
+# 0. Sample Annotation
+
+Define analysis directory
+```{r}
+analysisDir <- "~/data/analysis/"
+```
+
+Load sample table
+
+The samples.txt should contain multiple columns listing the meta information on the samples to analyze in rows. Mandatory columns are:
+
+*ID*: Sequencing ID (e.g. 2871), must be beginning of file names
+*Ident*: Library Identity (e.g. Pat1_Pool2)
+*Sanmple*: Sample Identity (e.g. Pat1)
+
+```{r}
+sample_table <- read.delim(paste(analysisDir,"samples.txt",sep=""), stringsAsFactors = T, header = T)
+
+# set rownames
+rownames(sample_table) <- sample_table$ID
+
+# relevel factors to ensure correct order while plotting
+sample_table$ID <- factor(sample_table$ID,levels = sample_table$ID)
+sample_table$Ident <- factor(sample_table$Ident,levels = unique(sample_table$Ident))
+sample_table$Sample <- factor(sample_table$Sample,levels = unique(sample_table$Sample))
+```
+
+# 1. Quality Control
+
+Define samples to import and analyze. This vector must contain the unique identifiers given in the file names you want to read in.
+```{r}
+samples <- sample_table$Ident
+```
+
+## Summary Statistics
+
+Define path to data directory
+```{r}
+dataDir <- "~/data/alignment/date/output/"
+```
+
+Load summary statistics
+```{r, results="hide"}
+summary.stats <- NULL
+
+for(i in 1:length(samples)){
+  # print the sample
+  print(paste(as.character(samples[i])))
+  # read the data
+  tmp <- fread(paste(dataDir, "summary/", samples[i], "_dge.summary.txt", sep = ""),header=TRUE, sep="\t")
+  # filter cells for more than 10 genes
+  tmp <- tmp[tmp$NUM_GENES>10,] 
+  # sort according to number of reads and calculate percentage of reads per cell for cumulative read plot
+  tmp <- tmp[order(tmp$NUM_GENIC_READS, decreasing = TRUE),]
+  tmp$readindex <- c(1:nrow(tmp))
+  tmp %>% mutate(cs = cumsum(NUM_GENIC_READS),index = 1:length(NUM_GENIC_READS)) -> tmp
+  tmp$percentage <- tmp$cs/sum(tmp$NUM_GENIC_READS)
+  # sort according to number of transcripts
+  tmp <- tmp[order(tmp$NUM_TRANSCRIPTS, decreasing = TRUE),]
+  tmp$transcriptindex <- c(1:nrow(tmp))
+  # sort according to number of genes
+  tmp <- tmp[order(tmp$NUM_GENES, decreasing = TRUE),]
+  tmp$geneindex <- c(1:nrow(tmp))
+  # add library meta information
+  tmp$ID <- sample_table[sample_table$Ident==samples[i],"ID"]
+  tmp$Ident <- sample_table[sample_table$Ident==samples[i],"Ident"]
+  tmp$Sample <- sample_table[sample_table$Ident==samples[i],"Sample"]
+  # combine information over libraries
+  summary.stats <- as.data.frame(rbind(summary.stats, tmp))
+}
+```
+
+*Number of cell barcodes per library*
+Cutoff: 10 genes per cell barcode
+
+```{r}
+table(summary.stats$Ident)
+```
+
+*Number of cell barcodes per sample*
+Cutoff: 10 genes per cell barcode
+
+```{r}
+table(summary.stats$Sample)
+```
+
+## 1.0 Preprocessing QC
+
+```{r, fig.width=18}
+# R1 fastqc statistics
+fastQC_R1 <- read.delim(paste(dataDir,"/reports/fastqc_barcodes_data/multiqc_fastqc.txt",sep=""), stringsAsFactors = T)
+fastQC_R1$Sample <- factor(unique(unlist(lapply(strsplit(as.character(fastQC_R1$Sample), "[_]"),
+                                                function(x) paste(x[1:length(x)-1],collapse="_")))),levels=sample_table$ID)
+fastQC_R1 <- fastQC_R1[order(fastQC_R1$Sample),]
+
+# R2 fastqc statistics
+fastQC_R2 <- read.delim(paste(dataDir,"/reports/fastqc_reads_data/multiqc_fastqc.txt",sep=""), stringsAsFactors = T)
+fastQC_R2$Sample <- fastQC_R1$Sample
+fastQC_R2 <- fastQC_R2[order(fastQC_R2$Sample),]
+
+# trimmomatic statistics
+trimmomaticQC <- read.delim(paste(dataDir,"/reports/filter_data/multiqc_trimmomatic.txt",sep=""), stringsAsFactors = T)
+trimmomaticQC$Sample <- fastQC_R1$Sample
+trimmomaticQC <- trimmomaticQC[order(trimmomaticQC$Sample),]
+
+# STAR alignment statistics
+starQC <- read.delim(paste(dataDir,"/reports/star_data/multiqc_star.txt",sep=""), stringsAsFactors = T)
+starQC$Sample <- factor(starQC$Sample,levels=sample_table$ID)
+starQC <- starQC[order(starQC$Sample),]
+
+# combine information into one data frame
+QC <- data.frame(total_reads = fastQC_R2$Total.Sequences,
+                 duplicate_readsR1 = - (fastQC_R1$Total.Sequences - fastQC_R1$Total.Sequences*fastQC_R1$total_deduplicated_percentage/100),
+                 deduplicated_readsR1 = fastQC_R1$Total.Sequences*fastQC_R1$total_deduplicated_percentage/100,
+                 duplicate_readsR2 = - (fastQC_R2$Total.Sequences - fastQC_R2$Total.Sequences*fastQC_R2$total_deduplicated_percentage/100),
+                 deduplicated_readsR2 = fastQC_R2$Total.Sequences*fastQC_R2$total_deduplicated_percentage/100,
+                 quality_dropped = - (fastQC_R2$Total.Sequences - trimmomaticQC$input_reads),
+                 quality_survived = fastQC_R2$Total.Sequences - (fastQC_R2$Total.Sequences - trimmomaticQC$input_reads),
+                 trimmomatic_dropped = - trimmomaticQC$dropped,
+                 trimmomatic_survived = trimmomaticQC$surviving,
+                 alignment_dropped = - (starQC$total_reads - starQC$uniquely_mapped),
+                 aligned_reads = starQC$uniquely_mapped,
+                 informative_genic_reads = summary.stats %>% 
+                   group_by(ID) %>% 
+                   summarise(informative_genic_reads = sum(NUM_GENIC_READS)) %>% 
+                   dplyr::select(informative_genic_reads),
+                 UMIs = summary.stats %>% 
+                   group_by(ID) %>% 
+                   summarise(UMIs = sum(NUM_TRANSCRIPTS)) %>% 
+                   dplyr::select(UMIs),
+                 ID = sample_table$ID,
+                 Ident = sample_table$Ident,
+                 Sample = sample_table$Sample)
+
+#Summary
+data.frame(totalNumbers=colSums(QC[,1:13]),
+           percentages=round(colSums(QC[,1:13])/sum(QC$total_reads)*100,2),
+           row.names=colnames(QC[,1:13]))
+
+```
+
+Plot preprocessing QC 
+```{r}
+ggplot(melt(QC), aes(x = Ident, y = value, fill = variable)) + 
+  geom_bar(stat = "identity", position = "dodge", colour = "black") + 
+  scale_y_continuous(breaks = c((c(5 , 10, 20, 30, 50) * -10^7),(c(5 , 10, 20, 30, 50) * 10^7)))+ 
+  ylab("Reads") + 
+  xlab("") +
+  ggtitle("Read Statistics") +
+  theme(axis.text.x = element_text(angle = 90, size = 9, hjust = 1, vjust = 1), 
+        strip.background = element_rect(fill = "white"), 
+        panel.background = element_rect(fill = "white", colour = "black"), 
+        legend.position = "right"
+  )
+```
+
+
+*Percentage of genic reads of aligned reads:*
+
+```{r}
+data.frame(ID=QC$ID,
+           Ident=QC$Ident,
+           Sample=QC$Sample,
+           Aligned_reads=QC$aligned_reads,
+           Genic_reads=QC$informative_genic_reads,
+           Percent=QC$informative_genic_reads/QC$aligned_reads*100)
+```
+
+## 1.1 Reads per Cell {.tabset .tabset-fade}
+
+### Line plot {.tabset .tabset-fade}
+
+#### Combined Plot
+
+```{r, fig.height= 6, fig.width= 10}
+ggplot(summary.stats, aes(readindex, NUM_GENIC_READS)) + 
+  geom_point(aes(colour=Ident),size=0.2) +
+  scale_y_log10()+
+  xlab("Cells sorted by read count")+
+  ylab("Number of genic reads")+
+  theme_bw() +
+  ggtitle("Genic reads per cell")
+```
+
+#### Split Plot
+
+```{r,fig.height=4, fig.width=12}
+ggplot(summary.stats, aes(readindex, NUM_GENIC_READS)) + 
+  geom_point(size=0.1) +
+  scale_y_log10()+
+  xlab("Cells sorted by read count")+
+  ylab("Number of genic reads")+
+  theme_bw() +
+  ggtitle("Genic reads per cell")+
+  facet_wrap(~ Ident,ncol=9)+
+  theme(legend.position="none")
+```
+
+#### Cumulative fraction of reads
+```{r, fig.height= 6, fig.width= 12}
+ggplot(summary.stats, aes(readindex, percentage)) + 
+  geom_point(aes(colour=Ident),size=0.2) +
+  xlab("cells sorted by read count")+
+  theme_bw()+
+  ggtitle("Cumulative fraction of reads")
+```
+
+### Violinplot {.tabset .tabset-fade}
+
+##### Library
+```{r, fig.width=12, fig.height=6}
+ggplot(summary.stats, aes(x=Ident, y=NUM_GENIC_READS)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  xlab("")+
+  ylab("Reads per Cell") +
+  theme_classic()
+```
+
+##### Sample
+```{r}
+ggplot(summary.stats, aes(x=Sample, y=NUM_GENIC_READS)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  ylab("Reads per Cell") +
+  theme_classic() +
+  xlab("")
+```
+
+### Cells left after cutoff
+```{r, fig.height=4, fig.width=14}
+cells_cutoff <- NULL
+for(i in seq(100, 2000, by=100)){
+  cells <- NULL
+  for(j in as.character(sample_table$ID)){
+    x <- sum(summary.stats[summary.stats$ID == j,]$NUM_GENIC_READS > i)
+    cells <- c(cells,x)
+  }
+  tmp <- data.frame(cutoff=i,
+             nCells = cells,
+             ID=sample_table$ID,
+             Ident=sample_table$Ident,
+             sample=sample_table$Sample)
+  cells_cutoff <- rbind(cells_cutoff,tmp)
+}
+
+ggplot(cells_cutoff,aes(y=nCells,x=cutoff))+
+    geom_line() +
+    scale_y_log10()+
+    scale_x_continuous()+
+    ggtitle("Number of cells above cutoff per sample") +
+    labs(y = "Number of present cells", x = "Read Cutoff") +
+    theme_bw()+
+    facet_wrap(~ Ident,ncol=9)+
+    theme(legend.position="none")
+```
+
+### % of genic reads/UMIs belonging to cells >100 genes?
+
+```{r}
+for(i in 1:length(unique(summary.stats$ID))){
+  tmp <- summary.stats[summary.stats$ID==as.character(unique(summary.stats$ID)[i]),]
+  print(paste(as.character(unique(tmp$Ident)),": ",
+              "total Reads: ", round(sum(tmp$NUM_GENIC_READS)/10^6,2)," million, ",
+              round(sum(tmp[tmp$NUM_GENES>=100,]$NUM_GENIC_READS)/sum(tmp$NUM_GENIC_READS)*100,2),
+              "% from cells with >100 genes; total UMIs: ",round(sum(tmp$NUM_TRANSCRIPTS)/10^6,2)," million, ",
+              round(sum(tmp[tmp$NUM_GENES>=100,]$NUM_TRANSCRIPTS)/sum(tmp$NUM_TRANSCRIPTS)*100,2),"% from cells with >100 genes",sep=""))
+}
+```
+
+## 1.2 UMIs per Cell
+
+### Line plot {.tabset .tabset-fade}
+
+#### Combined Plot
+```{r, fig.height= 6, fig.width= 10}
+ggplot(summary.stats, aes(transcriptindex, NUM_TRANSCRIPTS)) + 
+  geom_point(aes(colour=Ident), size=0.1) +
+  xlab("cells sorted by transcript count")+
+  ylab("Number of UMIs")+
+  scale_y_log10()+ 
+  theme_bw()+
+  ggtitle("UMIs per cell")
+```
+
+#### Split Plot
+
+```{r,fig.height=4, fig.width=12}
+ggplot(summary.stats, aes(transcriptindex, NUM_TRANSCRIPTS)) + 
+  geom_point(size=0.1) +
+  scale_y_log10()+
+  xlab("Cells sorted by UMI count")+
+  ylab("Number of UMIs")+
+  theme_bw() +
+  ggtitle("UMIs per cell")+
+  facet_wrap(~ Ident,ncol=9)+
+  theme(legend.position="none")
+```
+
+### Violinplot {.tabset .tabset-fade}
+
+#### Library
+
+```{r, fig.width=12, fig.height=6}
+ggplot(summary.stats, aes(x=Ident, y=NUM_TRANSCRIPTS)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  ylab("UMIs per Cell") +
+  theme_classic() +
+  xlab("")
+```
+
+#### Sample
+```{r}
+ggplot(summary.stats, aes(x=Sample, y=NUM_TRANSCRIPTS)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  ylab("UMIs per Cell") +
+  theme_classic() +
+  xlab("")
+```
+
+## 1.3 Genes per Cell
+
+### Line plot {.tabset .tabset-fade}
+
+#### Combined Plot
+
+```{r, fig.height= 6, fig.width= 10}
+ggplot(summary.stats, aes(geneindex, NUM_GENES)) + 
+  geom_point(aes(colour=Sample), size=0.1) +
+  scale_y_continuous()+
+  ylab("Number of Genes")+
+  xlab("Cells sorted by gene count")+
+  theme_bw() 
+```
+
+#### Split Plot
+
+```{r,fig.height=4, fig.width=12}
+ggplot(summary.stats, aes(geneindex, NUM_GENES)) + 
+  geom_point(size=0.1) +
+  scale_y_continuous()+
+  ylab("Number of Genes")+
+  xlab("Cells sorted by gene count")+
+  theme_bw() +
+  facet_wrap(~ Ident,ncol=9)+
+  theme(legend.position="none")
+```
+
+### Violinplot of Genes per cell {.tabset .tabset-fade}
+
+#### Library
+```{r, fig.width=12, fig.height=6}
+ggplot(summary.stats, aes(x=Ident, y=NUM_GENES)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  ylab("Genes per Cell") +
+  theme_classic() +
+  xlab("")
+```
+
+#### Sample
+```{r}
+ggplot(summary.stats, aes(x=Sample, y=NUM_GENES)) + 
+  geom_violin(scale="count")+
+  geom_jitter(height = 0, width = 0.1, size=0.001, alpha=0.1)+
+  scale_y_log10()+
+  ylab("Genes per Cell") +
+  theme_classic() +
+  xlab("")
+```
+
+## 1.4 Read/UMI per cell{.tabset .tabset-fade}
+
+#### Combined Plot
+```{r, fig.height= 4, fig.width= 6}
+ggplot(summary.stats, aes(x=NUM_GENIC_READS, y=NUM_TRANSCRIPTS)) + 
+  geom_smooth(se=FALSE,method='lm',color="grey")+
+  geom_point(aes(colour=Ident), size=0.5) +
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  ylab("Number of transcripts")+
+  xlab("Number of reads")+
+  coord_fixed()+
+  theme_bw()
+```
+
+#### Split Plot
+```{r, fig.height= 4, fig.width= 12}
+ggplot(summary.stats, aes(x=NUM_GENIC_READS, y=NUM_TRANSCRIPTS)) + 
+  geom_smooth(se=FALSE,method='lm', color="grey")+
+  geom_point(size=0.5)+
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  ylab("Number of transcripts")+
+  xlab("Number of reads")+
+  coord_fixed()+
+  theme_bw()+
+  theme(legend.position="none")+
+  facet_wrap(~ Ident,ncol=8)
+```
+
+
+## 1.5 Reads/Gene per cell{.tabset .tabset-fade}
+
+#### Combined Plot
+
+```{r, fig.height= 4, fig.width= 6}
+ggplot(summary.stats, aes(x=NUM_GENIC_READS, y=NUM_GENES)) + 
+  geom_smooth(se=FALSE,method='lm',color="grey")+
+  geom_point(aes(colour=Ident), size=0.5) +
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  coord_fixed()+
+  theme_bw()
+```
+
+#### Split Plot
+```{r, fig.height= 4, fig.width= 12}
+ggplot(summary.stats, aes(x=NUM_GENIC_READS, y=NUM_GENES)) + 
+  geom_smooth(se=FALSE,method='lm', color="grey")+
+  geom_point(size=0.5) +
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  ylab("Number of genes")+
+  xlab("Number of reads")+
+  coord_fixed()+
+  theme_bw()+
+  theme(legend.position="none")+
+  facet_wrap(~ Ident,ncol=8)
+```
+
+## 1.6 UMIs/Gene per cell{.tabset .tabset-fade}
+
+#### Combined Plot
+
+```{r, fig.height= 4, fig.width= 6}
+ggplot(summary.stats, aes(x=NUM_TRANSCRIPTS, y=NUM_GENES)) + 
+  geom_smooth(se=FALSE,method='lm',color="grey")+
+  geom_point(aes(colour=Ident), size=0.5) +
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  coord_fixed()+
+  theme_bw()
+```
+
+#### Split Plot
+```{r, fig.height= 8, fig.width= 14}
+ggplot(summary.stats, aes(x=NUM_TRANSCRIPTS, y=NUM_GENES)) + 
+  geom_smooth(se=FALSE,method='lm', color="grey")+
+  geom_point(size=0.5) +
+  scale_x_continuous()+
+  scale_y_continuous()+
+  geom_abline(slope=1)+
+  ylab("Number of genes")+
+  xlab("Number of transcripts")+
+  coord_fixed()+
+  theme_bw()+
+  theme(legend.position="none")+
+  facet_wrap(~ Ident,ncol=8)
+```
+
+<!-- ## 1.7 Sequencing information gain  {.tabset .tabset-fade} -->
+
+<!-- To assess the yet achieved sequencing depth per cell, we downsample the fastq files to certain percentages and visualize the UMIs per read ratio. Like this, we can evaluate whether deeper sequencing will yield more information or will just duplicate the existing information. -->
+
+<!-- sub5/sub2 stands for downsampling to every fifth/second read (20%/50%). -->
+
+<!-- Downsampling bash script: -->
+
+
+
+<!-- ```{r, fig.width=20, fig.height=18} -->
+<!-- stack_runs <- NULL -->
+
+<!-- for(i in 1:length(samples)){ -->
+<!--   print(as.character(samples[i])) -->
+<!--   sub5 <- fread(paste("~/data/alignment/subsampled_alignment/sub5/output/summary/", samples[i], "_dge.summary.txt", sep = ""),header=TRUE, sep="\t") -->
+<!--   sub5 <- sub5[sub5$NUM_GENES>10,] # filter cells for more than 10 genes -->
+<!--   sub5$flowcell <- "sub5" -->
+<!--   sub2 <- fread(paste("~/data/alignment/subsampled_alignment/sub2/output/summary/", samples[i], "_dge.summary.txt", sep = ""),header=TRUE, sep="\t") -->
+<!--   sub2 <- sub2[sub2$NUM_GENES>10,] # filter cells for more than 10 genes -->
+<!--   sub2$flowcell <- "sub2" -->
+<!--   one <- fread(paste("~/data/alignment/190320/output/summary/", samples[i], "_dge.summary.txt", sep = ""),header=TRUE, sep="\t") -->
+<!--   one <- one[one$NUM_GENES>10,] # filter cells for more than 10 genes -->
+<!--   one$flowcell <- "one" -->
+<!--   tmp <- do.call("rbind", list(sub10,sub5,sub2,one)) -->
+<!--   tmp$ID <- as.character(sample_table[sample_table$ID==samples[i],"ID"]) -->
+<!--   tmp$Ident <- as.character(sample_table[sample_table$ID==samples[i],"Ident"]) -->
+<!--   tmp$Sample <- as.character(sample_table[sample_table$ID==samples[i],"Sample"])  -->
+<!--   stack_runs <- as.data.frame(rbind(stack_runs, tmp)) -->
+<!-- } -->
+
+<!-- stack_runs$flowcell <- factor(stack_runs$flowcell, levels=c("sub5", -->
+<!--                                                             "sub2", -->
+<!--                                                             "one")) -->
+
+
+<!-- # Number of UMIs per flow cell -->
+<!-- stack_runs %>% -->
+<!--   group_by(flowcell) %>% -->
+<!--   summarise(UMIs = sum(NUM_TRANSCRIPTS)) -->
+
+<!-- # Number of UMIs per flow cell for cells with >100 genes -->
+<!-- stack_runs_filt <- stack_runs[stack_runs$NUM_GENES>100,] -->
+<!-- stack_runs_filt %>% -->
+<!--   group_by(flowcell) %>% -->
+<!--   summarise(UMIs = sum(NUM_TRANSCRIPTS)) -->
+<!-- ``` -->
+
+<!-- ### All libraries -->
+
+<!-- ```{r, fig.width=30, fig.height=15} -->
+<!-- sampled_cells <- NULL -->
+
+<!-- # sample 100 cells per library -->
+<!-- for(i in 1:length(sample_table$Ident)){ -->
+<!--   pool <- as.character(sample_table$Ident[i]) -->
+<!--   tmp <- stack_runs_filt[stack_runs_filt$Ident==pool,] -->
+<!--   tmp <- tmp[tmp$CELL_BARCODE %in% sample(tmp$CELL_BARCODE,ifelse(nrow(tmp)>100,100,nrow(tmp))),] -->
+<!--   sampled_cells <- rbind(sampled_cells, tmp) -->
+<!-- } -->
+
+<!-- # Linear scale -->
+<!-- ggplot(sampled_cells, aes(x=NUM_GENIC_READS, y=NUM_TRANSCRIPTS)) + -->
+<!--   geom_point(aes(color=flowcell)) + -->
+<!--   scale_x_continuous()+ -->
+<!--   scale_y_continuous(breaks=c(100,500,1000,1500,2000,2500)) + -->
+<!--   geom_line(aes(group=CELL_BARCODE), color="grey",alpha=0.1) + -->
+<!--   ylab("Number of transcripts")+ -->
+<!--   xlab("Number of reads")+ -->
+<!--   theme_bw() + theme(text = element_text(size=16)) +  -->
+<!--   facet_wrap(~ Ident,ncol=9, scales = "free") -->
+
+<!-- rm(sampled_cells) -->
+<!-- ``` -->
+
+<!-- ### Selected libraries -->
+
+<!-- ```{r, fig.width=10, fig.height=6} -->
+<!-- # Define library to plot -->
+<!-- pool <- "" -->
+<!-- tmp <- stack_runs_filt[stack_runs_filt$Ident==pool,] -->
+<!-- tmp <- tmp[tmp$CELL_BARCODE %in% sample(tmp$CELL_BARCODE,ifelse(nrow(tmp)>100,100,nrow(tmp))),] -->
+
+<!-- ggplot(tmp, aes(x=NUM_GENIC_READS, y=NUM_TRANSCRIPTS)) + -->
+<!--   geom_point(aes(color=flowcell)) + -->
+<!--   geom_line(aes(group=CELL_BARCODE), color="grey",alpha=0.1) + -->
+<!--   ylab("Number of transcripts")+ -->
+<!--   xlab("Number of reads")+ -->
+<!--   ggtitle(pool)+ -->
+<!--   theme_bw() + theme(text = element_text(size=12)) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- # clean up -->
+<!-- rm(sub5, sub2, one) -->
+<!-- ``` -->
+
+
+# 2. Gene expression
+
+```{r}
+count_list <- list()
+
+for(i in 1:length(samples)){
+  print(as.character(samples[i]))
+  tmp <- as.data.frame(fread(paste(dataDir, "summary/", samples[i], "_umi_expression_matrix.tsv", sep = ""),
+                             header=TRUE, stringsAsFactors = FALSE))
+  row.names(tmp)<- tmp$GENE
+  tmp$GENE <- NULL
+  print(dim(tmp))
+  tmp <- tmp[,apply(tmp, 2, function (x) {sum(x >= 1)})>100]
+  tmp <- tmp[apply(tmp, 1, function (x) {sum(x >= 1)})>3,]
+  count_list[[i]]<- tmp
+  names(count_list)[[i]] <- as.character(samples[i])
+  if(ncol(count_list[[i]])==0){count_list[[i]] <- NULL}
+}
+```
+
+### Prepare merged gene expression table
+
+```{r}
+expr <- data.frame()
+
+for(i in 1:length(count_list)){
+  print(names(count_list)[i])
+  tmp <- as.data.frame(count_list[[i]])
+  if(nrow(tmp)!=0){
+    colnames(tmp) <- paste(gsub("_",".",as.character(names(count_list))[i]), "_", colnames(tmp), sep="")
+    if(i==1){
+      expr <- tmp
+    }else {
+      expr <- merge(expr, tmp, by="row.names", all = TRUE)
+      rownames(expr)<-expr$Row.names
+      expr$Row.names <- NULL
+    }
+  }
+}
+
+expr[is.na(expr)] <- 0
+
+# save expression table
+#save(expr,file = paste(analysisDir,"Seqwell_RawExpressionMatrix_",Sys.Date(),".RData",sep=""))
+```
+
+*Number of cells: * `r ncol(expr)`
+
+*Number of genes: * `r nrow(expr)`
+
+*Percentage of 0 in data.frame: * `r (sum(expr==0)/(nrow(expr)*ncol(expr)))*100`
+
+#### Number of genes and cells per library
+
+```{r}
+genes <- NULL
+cells <- NULL
+UMI <- NULL
+
+for(i in 1:length(count_list)){
+  cells[i] <- ncol(count_list[[i]])
+  genes[i] <- nrow(count_list[[i]])
+  if(nrow(count_list[[i]])>0){UMI[i] <- sum(count_list[[i]])}else{UMI[i] <- 0}
+}
+
+data.frame(ID = sample_table[sample_table$Ident %in% names(count_list),]$ID,
+           Ident = sample_table[sample_table$Ident %in% names(count_list),]$Ident,
+           Sample = sample_table[sample_table$Ident %in% names(count_list),]$Sample,
+           GenesCutoff = 100,
+           cells = cells,
+           genes = genes,
+           UMI = UMI)
+```
+
+### Present Gene types
+```{r, fig.height=8, fig.width=6}
+genetypes <- read.delim(paste(analysisDir,"ID2SYMBOL_gencode_v27.txt",sep=""),header=FALSE,stringsAsFactors = FALSE)
+colnames(genetypes) <- c("ENSEMBL","SYMBOL","TYPE")
+
+GeneTypeExpr()
+```
+
+### Highest expressed genes
+
+```{r, fig.height=8, fig.width=6}
+highestGenes(input=expr,
+             numGenes=50)
+```
+
+### Percentage of counts from certain gene families of all counts per cell
+
+```{r, fig.width=12 ,fig.width= 8}
+percentofCountsperCell <- function(input=expr,
+                                   pattern){
+  tmp <- sum(input[grep(pattern = pattern, rownames(input), value = TRUE),])
+  sum_counts <- sum(colSums(input))
+  print(paste(round(tmp/sum_counts*100,2)," % of all counts come from ",pattern," genes",sep=""))
+
+  features <- grep(pattern = pattern, rownames(input), value = TRUE)
+  percent <- colSums(input[features,])/colSums(input)
+
+  data <- data.frame(percent=percent,
+                    cell=names(percent),
+                    sample= factor(gsub("\\.","_",x=unlist(lapply(strsplit(as.character(colnames(input)), "[_]"),function(x) x[1]))),levels=sample_table$Ident)
+                    )
+
+  ggplot(data, aes(x=sample, y=percent, fill=sample)) +
+    geom_jitter(height = 0, width = 0.1, size=0.05)+
+    ylab(paste("Percent of UMIs coming from ", pattern," genes per cell")) +
+    theme_classic() +
+    xlab("")+
+    theme(text = element_text(size=8),legend.position="none")
+}
+
+percentofCountsperCell(pattern="^MT-RNR")
+percentofCountsperCell(pattern="^MT-")
+percentofCountsperCell(pattern="^RPL|^RPS|^MRPS|^MRPL")
+```
+
+## Filter genes
+```{r, fig.height=8, fig.width=6}
+### Filter for protein-coding and lincRNAs
+genes_to_keep <- genetypes[grep("protein_coding|lincRNA",genetypes$TYPE),"SYMBOL"]
+
+### Exclude ribosomal and mitochondrial proteins
+genes_to_keep <- genes_to_keep[!grepl(pattern = "^RPL|^RPS|^MRPS|^MRPL", genes_to_keep)]
+
+### Filtering
+expr_filt <- expr[rownames(expr) %in% genes_to_keep,]
+
+### Plot highest expressed genes after filtering
+highestGenes(input=expr_filt)
+```
+
+## Load gene set annotation
+```{r}
+# MiSigDB gene sets
+hallmark_genes <- clusterProfiler::read.gmt(paste(analysisDir, "GMTfiles/h.all.v6.2.entrez.gmt",sep=""))
+cannonicalPathway_genes <- clusterProfiler::read.gmt(paste(analysisDir, "GMTfiles/c2.cp.v6.2.entrez.gmt",sep=""))
+immuno_genes <- clusterProfiler::read.gmt(paste(analysisDir, "GMTfiles/c7.all.v6.2.entrez.gmt",sep=""))
+motifs <- clusterProfiler::read.gmt(paste(analysisDir, "GMTfiles/c3.all.v6.2.entrez.gmt",sep=""))
+```
+
+---------------------------------------------------------------------------------------------------
+
+# 3. Seurat Analysis
+
+## Create Seurat object
+
+```{r}
+seurat  <- CreateSeuratObject(counts = as.data.frame(expr_filt),
+                            min.cells = 5,
+                            min.features = 150,
+                            project = "10x")
+seurat
+```
+
+### Add meta data
+
+```{r}
+cell_meta <- data.frame(cells = as.character(colnames(GetAssayData(object = seurat, slot = 'counts'))),
+                        library = as.character(seurat$orig.ident),
+                        row.names = as.character(colnames(GetAssayData(object = seurat, slot = 'counts'))),
+                        stringsAsFactors = FALSE)
+
+idx <- match(cell_meta$library, c(gsub("_",".",as.character(sample_table$Ident))))
+cell_meta$sample <- sample_table$Sample[idx]
+cell_meta$status <- sample_table$Status[idx]
+cell_meta$sex <- sample_table$Sex[idx]
+
+rm(idx)
+
+seurat[['sample']] <- cell_meta$sample
+seurat[['status']] <- cell_meta$status
+seurat[['sex']] <- cell_meta$sex
+```
+
+
+## Quality Control
+```{r, fig.width= 18}
+mito.features <- grep(pattern = "^MT-", x = rownames(x = seurat), value = TRUE)
+percent.mito <- Matrix::colSums(x = GetAssayData(object = seurat, slot = 'counts')[mito.features, ]) / Matrix::colSums(x = GetAssayData(object = seurat, slot = 'counts'))
+
+# The [[ operator can add columns to object metadata, and is a great place to stash QC stats
+seurat[['percent.mito']] <- percent.mito
+
+VlnPlot(object = seurat, features = "nFeature_RNA") + theme(legend.position="none") + ggtitle("Genes per Cell") + ylab("Number of Genes") + xlab("")
+VlnPlot(object = seurat, features = "nCount_RNA")+ theme(legend.position="none") + ggtitle("Transcripts per Cell") + ylab("Number of UMIs") + xlab("")
+VlnPlot(object = seurat, features = "percent.mito")+ theme(legend.position="none") + ggtitle("Percent of MT- counts") + ylab("% of '^mt-' gene counts of all counts") + xlab("")
+```
+
+## Filter cells
+```{r}
+seurat <- subset(x = seurat, subset = nFeature_RNA > 150 & nFeature_RNA < 3000 & percent.mito < 0.1)
+
+# Number of cells left after filtering
+seurat
+```
+
+#### Potential erythrocytes
+
+```{r, fig.width= 10}
+### Hemoglobin genes
+Hb.features <- grep(pattern = "^HBB|^HBA", x = rownames(x = seurat), value = TRUE)
+percent.Hb <- Matrix::colSums(x=GetAssayData(object=seurat,slot='counts')[Hb.features, ])/Matrix::colSums(x = GetAssayData(object=seurat,slot='counts'))
+
+seurat[['percent.Hb']] <- percent.Hb
+
+VlnPlot(object = seurat, features = "percent.Hb")+ theme(legend.position="none")
+
+FeatureScatter(object = seurat, feature1 = "nCount_RNA", feature2 = "percent.Hb")+
+  ggtitle("Percentage of hemoglobin count vs UMIs") +
+  ylab("% of hemoglobin counts of all counts")+
+  geom_hline(yintercept = 0.01) +
+  geom_text(aes(0, 0.01, label = paste(sum(percent.Hb>0.01)), vjust = -0.5), col = "red")+
+  geom_text(aes(0, 0.01, label = paste(sum(percent.Hb<0.01)), vjust = 1.5), col = "grey")+
+  theme(legend.position="none")
+
+# filter high HB cells
+# seurat <- subset(x = seurat, subset = percent.Hb < 0.1)
+```
+
+### Mean reads/genes per cell of filtered cells {.tabset .tabset-fade}
+```{r}
+cellID <- gsub("\\.","_",as.character(colnames(GetAssayData(object = seurat, slot = 'counts'))))
+summary.stats.filt <- summary.stats[paste(summary.stats$Ident,"_",summary.stats$CELL_BARCODE,sep="") %in% cellID,]
+
+# mean number of reads per cell
+round(mean(summary.stats.filt$NUM_GENIC_READS),0)
+# mean number of UMI per cell
+round(mean(summary.stats.filt$NUM_TRANSCRIPTS),0)
+# mean number of genes per cell
+round(mean(summary.stats.filt$NUM_GENES),0)
+```
+
+#### Histograms of reads
+```{r, fig.height=6, fig.width=12}
+ggplot(summary.stats.filt, aes(x=NUM_GENIC_READS))+
+  geom_histogram(binwidth = 1, alpha=0.5)+
+  scale_x_continuous() +
+  xlab("Reads per Cell, binwidth=1") +
+  ylab("Frequency")+
+  theme_classic() +
+  theme(text = element_text(size=8),legend.position="none")+
+  facet_grid(Ident ~ .,scales = "free")
+```
+
+#### Histograms of genes
+```{r, fig.height=6, fig.width=12}
+ggplot(summary.stats.filt, aes(x=NUM_GENES))+
+  geom_histogram(binwidth = 1, alpha=0.5)+
+  scale_x_continuous() +
+  xlab("Genes per Cell, binwidth=1") +
+  ylab("Frequency")+
+  theme_classic() +
+  theme(text = element_text(size=8),legend.position="none")+
+  facet_grid(Ident ~ .,scales = "free")
+```
+
+## Filter samples
+
+In case you want to filter the data set in order to exclude low quality samples, you can use WhichCells() to identify these cells in combination with SubsetData().
+
+<!-- ```{r} -->
+<!-- # filter seurat object -->
+
+<!-- Idents(object = seurat) <- "sample" -->
+<!-- seurat <- Seurat::SubsetData(object = seurat, cells = WhichCells(object = seurat, idents = c("pbmc_1"), invert = TRUE)) -->
+<!-- seurat -->
+<!-- ``` -->
+
+## Normalization
+```{r}
+seurat <- NormalizeData(object = seurat, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+
+## Define variable genes
+```{r, fig.width= 12}
+seurat <- FindVariableFeatures(object = seurat, assay="RNA",
+                               selection.method = 'mean.var.plot',
+                               mean.cutoff = c(0.0125, 3),
+                               dispersion.cutoff = c(0.5, Inf))
+
+length(x = VariableFeatures(object = seurat))
+var.features_1 <- VariableFeatures(object = seurat)
+
+seurat <- FindVariableFeatures(object = seurat, selection.method = 'vst', nfeatures = 1000)
+length(x = VariableFeatures(object = seurat))
+var.features_2 <- VariableFeatures(object = seurat)
+
+length(intersect(var.features_1,var.features_2))
+
+# use vst
+seurat <- FindVariableFeatures(object = seurat, selection.method = 'vst', nfeatures = 1000)
+```
+
+## Scale data
+```{r}
+seurat <- ScaleData(object = seurat, features = rownames(x = seurat), vars.to.regress = c("nCount_RNA"))
+```
+
+## PCA
+```{r, fig.height=12,fig.width=12}
+seurat <- RunPCA(object = seurat, features = VariableFeatures(object = seurat), verbose = FALSE)
+
+print(x = seurat[['pca']], dims = 1:15, nfeatures = 10, projected = FALSE)
+
+DimHeatmap(object = seurat, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+```{r}
+ElbowPlot(object = seurat)
+```
+
+
+## tSNE
+```{r, fig.width= 8, fig.height= 6}
+seurat <- RunTSNE(object = seurat, dims = 1:10, check_duplicates = FALSE)
+DimPlot(object = seurat, reduction = 'tsne')
+```
+
+## UMAP
+```{r, fig.width= 8, fig.height= 6}
+seurat <- RunUMAP(seurat, reduction.use = "pca", dims = 1:10)
+DimPlot(object = seurat, reduction = "umap")
+```
+
+## Sample Identity {.tabset .tabset-fade}
+
+### Sample
+```{r, fig.height=6, fig.width=7}
+sample_colors <- c("pbmc_1" = "#2f2483",
+                   "pbmc_2" = "#32ab6d")
+
+Idents(object = seurat) <- "sample"
+DimPlot(object = seurat, reduction = "umap")+
+  scale_color_manual(values=sample_colors)
+```
+
+```{r, fig.height=6, fig.width=14}
+DimPlot(object = seurat, reduction = "umap", split.by = "sample")+
+  scale_color_manual(values=sample_colors)
+```
+
+### Sex
+```{r, fig.height=6, fig.width=7}
+sex_colors <- c("female" = "steelblue",
+                "male" = "firebrick2",
+                "unknown"="steelblue")
+
+Idents(object = seurat) <- "sex"
+DimPlot(object = seurat, reduction = "umap")+scale_color_manual(values=sex_colors)
+```
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(object = seurat, reduction = "umap", split.by = "sex")
+```
+
+### Status
+```{r, fig.height=6, fig.width=7}
+status_colors <- c("ctrl" = "slategrey",
+                "pat" = "red1")
+
+Idents(object = seurat) <- "status"
+DimPlot(object = seurat, reduction = "umap")+scale_color_manual(values=status_colors)
+```
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(object = seurat, reduction = "umap", split.by = "status")+scale_color_manual(values=status_colors)
+```
+
+## Clustering
+
+Find neighbours
+```{r, fig.width=16,fig.height=20}
+seurat <- FindNeighbors(object = seurat, dims = 1:10, reduction="pca", force.recalc = TRUE)
+```
+
+Iterate through cluster algorithms & resolutions
+
+Resolution:
+Value of the resolution parameter, use a value above (below) 1.0 if you want to obtain a larger (smaller) number of communities.
+
+Clustering:
+Algorithm for modularity optimization
+  1 = original Louvain algorithm
+  2 = Louvain algorithm with multilevel refinement
+  3 = SLM algorithm
+  4 = Leiden algorithm
+
+```{r, fig.height= 50, fig.width=20}
+clustering_list <- list()
+for(i in seq(from=0.1, to=1.5, by=0.1)){
+  print(paste("Calculating clustering for resolution: ", i, sep=""))
+  for(j in c(1:4)){
+  print(paste("Using Clustering algorithm: ", j, sep=""))
+  tmp <- seurat
+  tmp <- FindClusters(object = tmp, resolution = i, algorithm = j, verbose = FALSE)
+  clustering_list[[length(clustering_list)+1]] <- DimPlot(object = tmp, reduction = "umap", label = TRUE) + NoLegend() + ggtitle(paste("Algorithm:", j,", Resolution: ",i, sep=""))
+  rm(tmp)
+  }
+}
+CombinePlots(clustering_list,ncol=4)
+```
+
+
+### Final Clustering {.tabset .tabset-fade}
+```{r}
+seurat <- FindClusters(object = seurat, resolution = 0.6, algorithm = 1)
+
+clustering <- "RNA_snn_res.0.6"
+```
+
+#### tSNE
+```{r, fig.width= 8, fig.height= 6}
+DimPlot(object = seurat, reduction = 'tsne',label = TRUE)
+```
+
+#### UMAP
+```{r, fig.width= 8, fig.height= 6}
+DimPlot(object = seurat, reduction = 'umap',label = TRUE)
+```
+
+```{r, fig.width= 18, fig.height= 6}
+DimPlot(object = seurat, reduction = 'umap', split.by = clustering, ncol = 4)+NoLegend()
+```
+
+### Cells per sample per cluster
+
+```{r, fig.width=12, fig.height=12}
+Idents(object = seurat) <- "status"
+DimPlot(object = seurat, reduction = 'umap',label = FALSE, split.by = clustering)
+```
+
+
+```{r, fig.width=4, fig.height=6}
+Idents(object = seurat) <- clustering
+
+tmp <- data.frame(Sample = seurat$sample,
+                  Cluster = seurat@active.ident,
+                  Status = seurat$status)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Sample),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_classic()+
+  theme(text = element_text(size=16))  +
+  scale_fill_manual(values=sample_colors)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Status),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_classic()+
+  theme(text = element_text(size=16))  +
+  scale_fill_manual(values=sample_colors)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Sample))+
+  ggtitle("Number of cells from each sample per cluster")+
+  theme_bw()
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Status),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_bw()
+
+rm(tmp)
+```
+
+## PBMC marker gene expression
+```{r, fig.height=15, fig.width=15}
+FeaturePlot(object = seurat,
+            features = c("IL7R","CD14","LYZ",
+                         "MS4A1","CD8A","FCGR3A",
+                         "MS4A7","GNLY","NKG7",
+                         "FCER1A","CST3","PPBP"),
+            cols = c("lightgrey", "darkslateblue"),
+            reduction = "umap",
+            pt.size = 1, ncol = 3)
+```
+
+## Identify cluster marker genes
+```{r}
+seurat.markers.wilcox <- FindAllMarkers(object = seurat, test.use="wilcox", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.wilcox %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.wilcox$gene)
+
+seurat.markers.bimod <- FindAllMarkers(object = seurat, test.use="bimod", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.bimod %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.bimod$gene)
+
+seurat.markers.roc <- FindAllMarkers(object = seurat, test.use="roc", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.roc %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.roc$gene)
+
+seurat.markers.t <- FindAllMarkers(object = seurat, test.use="t", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.t %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.t$gene)
+
+seurat.markers.negbinom <- FindAllMarkers(object = seurat, test.use="negbinom", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.negbinom %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.negbinom$gene)
+
+seurat.markers.poisson <- FindAllMarkers(object = seurat, test.use="poisson", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.poisson %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.poisson$gene)
+
+seurat.markers.LR <- FindAllMarkers(object = seurat, test.use="LR", only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat.markers.LR %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+length(seurat.markers.LR$gene)
+
+Reduce(intersect, list(seurat.markers.wilcox$gene,
+                       seurat.markers.bimod$gene,
+                       seurat.markers.roc$gene,
+                       seurat.markers.t$gene,
+                       seurat.markers.negbinom$gene,
+                       seurat.markers.poisson$gene,
+                       seurat.markers.LR$gene))
+```
+
+Top 10 marker genes found by wilcoxon test
+```{r, fig.height= 12, fig.width= 8}
+seurat.markers.wilcox %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+```
+
+### Plot expression of marker genes
+
+#### Umap
+
+```{r, fig.height=8, fig.width=8}
+seurat.markers.wilcox %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC) -> top3
+
+plot_list <- list()
+
+for(i in 1:length(top3$gene)){
+  plot_list[[i]] <- FeaturePlot(object = seurat,
+            features = top3$gene[i],
+            cols = c("grey20", "green2"),
+            reduction = "umap",
+            pt.size = 0.07)+NoLegend()+DarkTheme()
+}
+
+CombinePlots(plot_list,ncol=3)
+```
+
+# 4. SingleR
+```{r, message = FALSE, echo = TRUE,warning=FALSE, results= "hide"}
+input <- as.data.frame(GetAssayData(object = seurat, slot = 'counts'))
+
+singleR_seurat <- CreateSinglerObject(counts= input,
+                                      annot = NULL,
+                                      min.genes = 100,
+                                      project.name = "10X",
+                                      technology = "10X",
+                                      species = "Human",
+                                      ref.list =  list(),
+                                      normalize.gene.length = F,
+                                      variable.genes = "de",
+                                      fine.tune = T,
+                                      do.signatures = F,
+                                      do.main.types = T,
+                                      reduce.file.size = T,
+                                      numCores = 4)
+
+singleR_seurat$seurat = seurat
+singleR_seurat$meta.data$orig.ident = seurat$orig.ident
+singleR_seurat$meta.data$clusters = seurat$RNA_snn_res.0.6
+```
+
+## Main types {.tabset .tabset-fade}
+
+### HPCA
+
+```{r, fig.width=10, fig.height=8}
+singleR_seurat$meta.data$xy = Embeddings(object = seurat, reduction = "umap") # the tSNE coordinates
+
+out_singleR_umap <- SingleR.PlotTsne(SingleR = singleR_seurat$singler[[1]]$SingleR.single.main,
+                 xy = singleR_seurat$meta.data$xy,
+                 labels = singleR_seurat$singler[[1]]$SingleR.single.main$labels,
+                 clusters = NULL,
+                 do.letters = FALSE,
+                 dot.size = 2,
+                 do.labels = TRUE,
+                 do.legend = TRUE,
+                 label.size = 4,
+                 title = "",
+                 colors = singler.colors,
+                 font.size = NULL,
+                 alpha = 0.5)
+
+out_singleR_umap$p + ylab("UMAP_2") + xlab("UMAP_1")
+```
+
+### Blueprint-Encode
+
+```{r, fig.width=10, fig.height=8}
+singleR_seurat$meta.data$xy = Embeddings(object = seurat, reduction = "umap") # the tSNE coordinates
+
+out_singleR_umap <- SingleR.PlotTsne(SingleR = singleR_seurat$singler[[2]]$SingleR.single.main,
+                 xy = singleR_seurat$meta.data$xy,
+                 labels = singleR_seurat$singler[[2]]$SingleR.single.main$labels,
+                 clusters = NULL,
+                 do.letters = FALSE,
+                 dot.size = 2,
+                 do.labels = TRUE,
+                 do.legend = TRUE,
+                 label.size = 4,
+                 title = "",
+                 colors = singler.colors,
+                 font.size = NULL,
+                 alpha = 0.5)
+
+out_singleR_umap$p + ylab("UMAP_2") + xlab("UMAP_1")
+```
+
+Seurat Plotting
+```{r, fig.width=6, fig.height=6}
+seurat[['BluePrintEncode']] <- singleR_seurat$singler[[2]]$SingleR.single.main$labels[,1]
+Idents(object = seurat) <- "BluePrintEncode"
+
+DimPlot(object = seurat, reduction = "umap")+
+  DarkTheme()
+```
+
+### SingleR Heatmap
+```{r,fig.width=6,fig.height=7}
+# data manipulation
+scores = singleR_seurat$singler[[2]]$SingleR.single.main$scores
+m = apply(t(scale(t(scores))), 2, max)
+thres = sort(m, decreasing = TRUE)[min(11, length(m))]
+data = as.matrix(scores)
+mmax = rowMax(data)
+mmin = rowMin(data)
+data = (data - mmin)/(mmax - mmin)
+data = data^3
+data = data[, m > (thres - 1e-06)]
+data = t(data)
+
+# order according to clustering
+clusters = singleR_seurat$meta.data$clusters
+data = data[, order(clusters)]
+
+# color scheme
+colors=hue_pal()(9)
+names(colors)<- c(0:8)
+ann_colors = list(cluster=colors)
+#plot
+
+# file = paste(analysisDir,"singleR_heatmap.pdf",sep="")
+# pdf(file,width=6,height=8)
+pheatmap(data,
+         color=colorRampPalette(c("black","firebrick1","red"))(100),
+         show_colnames = FALSE,
+         fontsize_row = 7,
+         cluster_cols=F,
+         annotation_col = data.frame(cluster=singleR_seurat$meta.data$clusters,
+                                     row.names=names(singleR_seurat$meta.data$clusters)),
+         annotation_colors=ann_colors,
+         annotation_legend=FALSE,
+         fontsize = 10)
+# dev.off()
+```
+
+
+## Subtypes {.tabset .tabset-fade}
+
+### HPCA
+
+```{r, fig.height=12, fig.width=24}
+singleR_seurat$meta.data$xy = Embeddings(object = seurat, reduction = "umap") # the tSNE coordinates
+
+out_singleR_umap <- SingleR.PlotTsne(SingleR = singleR_seurat$singler[[1]]$SingleR.single,
+                 xy = singleR_seurat$meta.data$xy,
+                 labels = singleR_seurat$singler[[1]]$SingleR.single$labels,
+                 clusters = NULL,
+                 do.letters = FALSE,
+                 dot.size = 2,
+                 do.labels = TRUE,
+                 do.legend = TRUE,
+                 label.size = 6,
+                 title = "",
+                 colors = singler.colors,
+                 font.size = NULL,
+                 alpha = 0.5)
+
+out_singleR_umap$p + ylab("UMAP_2") + xlab("UMAP_1")
+```
+
+### Blueprint-Encode
+
+```{r, fig.height=10, fig.width=10}
+singleR_seurat$meta.data$xy = Embeddings(object = seurat, reduction = "umap") # the tSNE coordinates
+
+out_singleR_umap <- SingleR.PlotTsne(SingleR = singleR_seurat$singler[[2]]$SingleR.single,
+                 xy = singleR_seurat$meta.data$xy,
+                 labels = singleR_seurat$singler[[2]]$SingleR.single$labels,
+                 clusters = NULL,
+                 do.letters = FALSE,
+                 dot.size = 2,
+                 do.labels = TRUE,
+                 do.legend = FALSE,
+                 label.size = 4,
+                 title = "",
+                 colors = singler.colors,
+                 alpha = 0.5)
+
+file = paste(analysisDir,"singleR_umap.pdf",sep="")
+pdf(file,width=10,height=10)
+out_singleR_umap$p + ylab("UMAP_2") + xlab("UMAP_1")
+dev.off()
+```
+
+```{r}
+seurat[['BluePrintEncode_subtypes']] <- singleR_seurat$singler[[2]]$SingleR.single$labels[,1]
+Idents(object = seurat) <- "BluePrintEncode_subtypes"
+DimPlot(object = seurat, reduction = "umap")
+```
+
+### Umap split by cell types
+```{r, fig.width=14,fig.height=12}
+Idents(object = seurat) <- "status"
+
+seurat[['BluePrintEncode']] <- singleR_seurat$singler[[2]]$SingleR.single.main$labels[,1]
+DimPlot(object = seurat, reduction = "umap", split.by = "BluePrintEncode")
+
+seurat[['HPCA']] <- singleR_seurat$singler[[1]]$SingleR.single.main$labels[,1]
+DimPlot(object = seurat, reduction = "umap", split.by = "HPCA")
+```
+
+
+# 5. Cluster specific DE gene analysis
+
+```{r}
+# set identity to clusters
+Idents(object = seurat) <- clustering
+
+# iterate through clusters and find IBD specific DE genes
+for(i in 0:(length(unique(seurat$RNA_snn_res.0.4))-1)){
+  print(paste("Cluster ",i,sep=""))
+  seurat_cluster <- SubsetData(object = seurat,ident.use = i)
+
+  Idents(object = seurat_cluster) <- "status"
+  markers <- FindAllMarkers(object = seurat_cluster, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.25)
+  markers %>% group_by(cluster) %>% top_n(n = 50, wt = avg_logFC) -> top50
+
+  top50 <- as.data.frame(top50)
+  top50$orig.cluster <- paste("Cluster",i,sep="")
+
+  dir.create(paste(analysisDir,"ClusterDEGs_",Sys.Date(),sep=""))
+  write.table(top50,
+             paste(analysisDir,"ClusterDEGs_",Sys.Date(),"/Cluster_",i,"_ctrlvspat_top50.txt", sep = ""),
+              sep = "\t",
+              quote = F,
+              row.names = F)
+
+  if(i==0){
+    clusterDE <- top50
+  }else{
+    clusterDE <- rbind(clusterDE,top50)
+  }
+}
+```
+
+## Cluster 0 {.tabset .tabset-fade}
+
+### Dim Reduction
+
+```{r}
+Idents(object = seurat) <- clustering
+seurat_0 <- SubsetData(object = seurat,ident.use = "0")
+
+Idents(object = seurat_0) <- "status"
+DimPlot(object = seurat_0, reduction = "umap")
+```
+
+### Marker Heatmap
+```{r, fig.height=12,fig.width=8}
+DoHeatmap(object = seurat_0, features = clusterDE[clusterDE$orig.cluster=="Cluster0",]$gene) +
+  NoLegend()
+```
+
+### GSEA
+```{r, fig.width=8}
+GSEA_cluster1 <- GSEA(object=seurat,
+                 cluster=0,
+                 clustering=clustering,
+                 condition ="status",
+                 top=100,
+                 GeneSets =c("GO","KEGG","Hallmark","Motifs"),
+                 GOntology = "BP",
+                 pCorrection = "bonferroni", # choose the p-value adjustment method
+                 pvalueCutoff = 0.2, # set the unadj. or adj. p-value cutoff (depending on correction method)
+                 qvalueCutoff = 0.2 # set the q-value cutoff (FDR corrected)
+)
+```
+
+#### GO
+```{r}
+dotplotGSEA(GSEA_cluster0$GOdown)
+dotplotGSEA(GSEA_cluster0$GOup)
+```
+
+#### KEGG
+```{r}
+dotplotGSEA(GSEA_cluster0$KEGGdown)
+dotplotGSEA(GSEA_cluster0$KEGGup)
+```
+
+#### HALLMARK
+```{r}
+dotplotGSEA(GSEA_cluster0$HALLMARKdown)
+dotplotGSEA(GSEA_cluster0$HALLMARKup)
+```
+
+#### TF Motifs
+```{r}
+dotplotGSEA(GSEA_cluster0$Motifdown)
+dotplotGSEA(GSEA_cluster0$Motifup)
+```
+
+
+
+## Cluster 1 {.tabset .tabset-fade}
+
+### Dim Reduction
+
+```{r}
+Idents(object = seurat) <- clustering
+seurat_1 <- SubsetData(object = seurat,ident.use = "1")
+
+Idents(object = seurat_1) <- "status"
+DimPlot(object = seurat_1, reduction = "umap")
+```
+
+### Marker Heatmap
+```{r, fig.height=12,fig.width=8}
+DoHeatmap(object = seurat_1, features = clusterDE[clusterDE$orig.cluster=="Cluster1",]$gene) +
+  NoLegend()
+
+markers <- FindAllMarkers(object = seurat_1, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.25)
+markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_logFC) -> top20
+markers %>% top_n(n = 20, wt = avg_logFC) -> top20
+markers_pat <- markers[markers$cluster=="pat",]
+markers_pat %>% top_n(n = 50, wt = avg_logFC) -> top50_pat
+
+DoHeatmap(object = seurat_1, features = top50_pat$gene,angle = 0) +
+  NoLegend()  +
+  scale_fill_gradientn(colors = c("black", "white", "red"))
+```
+
+### GSEA
+```{r, fig.width=8}
+GSEA_cluster1 <- GSEA(object=seurat,
+                 cluster=1,
+                 clustering=clustering,
+                 condition ="status",
+                 top=100,
+                 GeneSets =c("GO","KEGG","Hallmark","Motifs"),
+                 GOntology = "BP",
+                 pCorrection = "bonferroni", # choose the p-value adjustment method
+                 pvalueCutoff = 0.2, # set the unadj. or adj. p-value cutoff (depending on correction method)
+                 qvalueCutoff = 0.2 # set the q-value cutoff (FDR corrected)
+)
+```
+
+#### GO
+```{r}
+dotplotGSEA(GSEA_cluster1$GOdown)
+dotplotGSEA(GSEA_cluster1$GOup)
+```
+
+#### KEGG
+```{r}
+dotplotGSEA(GSEA_cluster1$KEGGdown)
+dotplotGSEA(GSEA_cluster1$KEGGup)
+```
+
+#### HALLMARK
+```{r}
+dotplotGSEA(GSEA_cluster1$HALLMARKdown)
+dotplotGSEA(GSEA_cluster1$HALLMARKup)
+```
+
+#### TF Motifs
+```{r}
+dotplotGSEA(GSEA_cluster1$Motifdown)
+dotplotGSEA(GSEA_cluster1$Motifup)
+```
+
+## Cluster 2 {.tabset .tabset-fade}
+
+### Dim Reduction
+
+```{r, fig.height=7,fig.width=8}
+Idents(object = seurat) <- clustering
+seurat_2 <- SubsetData(object = seurat,ident.use = "2")
+
+Idents(object = seurat_2) <- "status"
+DimPlot(object = seurat_2, reduction = "umap")
+```
+
+### Marker Heatmap
+
+```{r, fig.height=8,fig.width=4}
+DoHeatmap(object = seurat_2, features = clusterDE[clusterDE$orig.cluster=="Cluster2",]$gene,angle = 0) + NoLegend()
+
+markers <- FindAllMarkers(object = seurat_2, only.pos = TRUE, min.pct = 0.2, logfc.threshold = 0.25)
+markers %>% group_by(cluster) %>% top_n(n = 20, wt = avg_logFC) -> top20
+markers %>% top_n(n = 20, wt = avg_logFC) -> top20
+markers_pat <- markers[markers$cluster=="pat",]
+markers_pat %>% top_n(n = 50, wt = avg_logFC) -> top50_pat
+
+DoHeatmap(object = seurat_2, features = top50_pat$gene,angle = 0) +
+  NoLegend()  +
+  scale_fill_gradientn(colors = c("black", "white", "red"))
+```
+
+### GSEA
+```{r, fig.width=9, fig.height=9}
+GSEA_cluster2 <- GSEA(object=seurat,
+                 cluster=2,
+                 clustering=clustering,
+                 condition ="status",
+                 top=100,
+                 GeneSets =c("GO","KEGG","Hallmark","Motifs"),
+                 GOntology = "BP",
+                 pCorrection = "bonferroni", # choose the p-value adjustment method
+                 pvalueCutoff = 0.2, # set the unadj. or adj. p-value cutoff (depending on correction method)
+                 qvalueCutoff = 0.2 # set the q-value cutoff (FDR corrected)
+)
+```
+
+#### GO
+```{r}
+dotplotGSEA(GSEA_cluster2$GOdown)
+dotplotGSEA(GSEA_cluster2$GOup)
+```
+
+#### KEGG
+```{r}
+dotplotGSEA(GSEA_cluster2$KEGGdown)
+dotplotGSEA(GSEA_cluster2$KEGGup)
+```
+
+#### HALLMARK
+```{r}
+dotplotGSEA(GSEA_cluster2$HALLMARKdown)
+dotplotGSEA(GSEA_cluster2$HALLMARKup)
+```
+
+#### TF Motifs
+```{r}
+dotplotGSEA(GSEA_cluster2$Motifdown)
+dotplotGSEA(GSEA_cluster2$Motifup)
+```
+
+-------------------------------------------------------------------------------
+
+# 6. Seurat analysis using scTransform
+
+Following: https://rawgit.com/ChristophH/sctransform/master/inst/doc/seurat.html &  https://www.biorxiv.org/content/10.1101/576827v2
+
+```{r}
+seurat_scTransform  <- CreateSeuratObject(counts = as.data.frame(expr_filt),
+                            min.cells = 5,
+                            min.features = 150,
+                            project = "SYSCID")
+
+# add meta information
+IDX <- match(as.character(seurat_scTransform$orig.ident), c(gsub("_",".",as.character(sample_table$Ident))))
+seurat_scTransform[['sample']] <- sample_table$Sample[IDX]
+seurat_scTransform[['status']] <- sample_table$Status[IDX]
+seurat_scTransform[['sex']] <- sample_table$Sex[IDX]
+
+mito.features <- grep(pattern = "^MT-", x = rownames(x = seurat_scTransform), value = TRUE)
+percent.mito <- Matrix::colSums(x = GetAssayData(object = seurat_scTransform, slot = 'counts')[mito.features, ]) / Matrix::colSums(x = GetAssayData(object = seurat_scTransform, slot = 'counts'))
+seurat_scTransform[['percent.mito']] <- percent.mito
+
+# filter cells
+seurat_scTransform <- subset(x = seurat_scTransform, subset = nFeature_RNA > 150 & nFeature_RNA < 2500 & percent.mito < 0.1)
+
+seurat_scTransform
+```
+
+## scTransform
+```{r}
+# Note that this single command replaces NormalizeData, ScaleData, and FindVariableFeatures.
+# Transformed data will be available in the SCT assay, which is set as the default after running sctransform
+seurat_scTransform <- SCTransform(object = seurat_scTransform, verbose = FALSE)
+```
+
+
+## PCA
+```{r, fig.height=12,fig.width=12}
+seurat_scTransform <- RunPCA(object = seurat_scTransform, features = VariableFeatures(object = seurat_scTransform), verbose = FALSE)
+
+print(x = seurat_scTransform[['pca']], dims = 1:15, nfeatures = 10, projected = FALSE)
+
+DimHeatmap(object = seurat_scTransform, dims = 1:10, cells = 500, balanced = TRUE)
+```
+
+```{r}
+ElbowPlot(object = seurat_scTransform)
+```
+
+## UMAP
+```{r}
+seurat_scTransform <- RunUMAP(object = seurat_scTransform, dims = 1:10, verbose = FALSE)
+```
+
+### Sample Identity {.tabset .tabset-fade}
+
+#### Sample
+```{r, fig.height=6, fig.width=7}
+Idents(object = seurat_scTransform) <- "sample"
+
+DimPlot(object = seurat_scTransform, reduction = "umap")
+```
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(object = seurat_scTransform, reduction = "umap", split.by = "sample")
+```
+
+#### Status
+```{r, fig.height=6, fig.width=7}
+Idents(object = seurat_scTransform) <- "status"
+DimPlot(object = seurat_scTransform, reduction = "umap")
+```
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(object = seurat_scTransform, reduction = "umap", split.by = "status")
+```
+
+
+#### Sex
+```{r, fig.height=6, fig.width=7}
+Idents(object = seurat_scTransform) <- "sex"
+DimPlot(object = seurat_scTransform, reduction = "umap")
+```
+
+```{r, fig.height=6, fig.width=10}
+DimPlot(object = seurat_scTransform, reduction = "umap", split.by = "sex")
+```
+
+## Clustering
+```{r}
+seurat_scTransform <- FindNeighbors(object = seurat_scTransform, dims = 1:10, verbose = FALSE)
+seurat_scTransform <- FindClusters(object = seurat_scTransform, verbose = FALSE,resolution = 0.6, algorithm=1)
+```
+
+### UMAP
+```{r}
+DimPlot(object = seurat_scTransform, reduction = "umap", label = TRUE)
+```
+
+```{r, fig.width=16,fig.height=16}
+DimPlot(object = seurat_scTransform, reduction = "umap", label = TRUE, split.by = "SCT_snn_res.0.6")
+```
+
+#### Cells per sample per cluster
+```{r, fig.width=6, fig.height=6}
+Idents(object = seurat_scTransform) <- "SCT_snn_res.0.6"
+
+tmp <- data.frame(Sample = seurat_scTransform$sample,
+                  Cluster = seurat_scTransform@active.ident,
+                  Status = seurat_scTransform$status)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Sample),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_classic()+
+  theme(text = element_text(size=16))  +
+  scale_fill_manual(values=sample_colors)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Status),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_classic()+
+  theme(text = element_text(size=16))  +
+  scale_fill_manual(values=sample_colors)
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Sample))+
+  ggtitle("Number of cells from each sample per cluster")+
+  theme_bw()
+
+ggplot(tmp, aes(Cluster))+
+  geom_bar(aes(fill = Status),position = "fill")+
+  ggtitle("Percentage of cells from each sample per cluster")+
+  theme_bw()
+
+rm(tmp)
+```
+
+### Compare scTransform and log-normalization
+```{r}
+# compare UMAP
+Idents(object = seurat) <- "RNA_snn_res.0.5"
+plot1 <- DimPlot(object = seurat, reduction = "umap", label = TRUE) + NoLegend() + ggtitle('log-normalization')
+plot2 <- DimPlot(object = seurat_scTransform, reduction = "umap", label = TRUE)+ NoLegend() + ggtitle('scTransform')
+CombinePlots(list(plot1,plot2))
+
+```
+
+### Identify cluster marker genes
+```{r}
+seurat_scTransform.markers <- FindAllMarkers(object = seurat_scTransform, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+seurat_scTransform.markers %>% group_by(cluster) %>% top_n(n = 3, wt = avg_logFC)
+```
+
+
+### Heatmap of Cluster marker genes
+
+```{r, fig.height= 12, fig.width= 10}
+seurat_scTransform.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC) -> top10
+DoHeatmap(object = seurat_scTransform, features = top10$gene, angle = 0, size = 4) +
+  NoLegend() +
+  scale_fill_gradientn(colors = c("blue", "white", "red"))
+```
+
+-------------------------------------------------------------------------------
+
+object sizes
+```{r}
+for (thing in ls()) { message(thing); print(object.size(get(thing)), units='auto') }
+```
+
+save Seurat Object $ session
+```{r}
+save(seurat,file = paste(analysisDir,"SeuratObject_",Sys.Date(),".RData",sep=""))
+save.image(file = paste("~/data/analysis/Environment_seurat3_",Sys.Date(),".RData",sep=""))
+```
+
+Session Info
+```{r}
+sessionInfo()
+```
